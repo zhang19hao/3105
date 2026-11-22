@@ -13,6 +13,11 @@ struct AppDataBrowserView: View {
     @State private var errorMessage: String?
     @State private var hasLoaded = false
     @State private var workspaceURL: URL?
+    @State private var isShowingPathJump = false
+    @State private var pathJumpInput = ""
+    @State private var pathJumpError: String?
+    @State private var isResolvingPath = false
+    @State private var recentPaths: [String] = PathJumpRecents.load()
     @Binding private var tabSession: FilesTabSession
     let onOpenSettings: () -> Void
     let onOpenLogs: () -> Void
@@ -105,6 +110,9 @@ struct AppDataBrowserView: View {
                     )
                 }
             }
+            .sheet(isPresented: $isShowingPathJump) {
+                pathJumpSheet
+            }
         }
     }
 
@@ -132,6 +140,26 @@ struct AppDataBrowserView: View {
 
     private var appRows: some View {
         List {
+            Section {
+                Button {
+                    pathJumpInput = ""
+                    pathJumpError = nil
+                    recentPaths = PathJumpRecents.load()
+                    isShowingPathJump = true
+                } label: {
+                    HStack(spacing: 10) {
+                        AppRowIcon(systemName: "arrow.turn.down.right")
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(pathJumpStrings.rowTitle)
+                                .font(.subheadline.weight(.semibold))
+                            Text(pathJumpStrings.rowSubtitle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
             if let workspaceURL {
                 Section(language.text("browser.workspace")) {
                     let workspaceDestination = FileBrowserDestination(
@@ -247,6 +275,140 @@ struct AppDataBrowserView: View {
         } label: {
             Label(language.text("browser.open_new_tab"), systemImage: "square.on.square")
         }
+    }
+
+    // MARK: - Open specified path
+
+    private var pathJumpStrings: PathJumpStrings {
+        PathJumpStrings(language: language)
+    }
+
+    private var pathJumpSheet: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField(pathJumpStrings.placeholder, text: $pathJumpInput)
+                        .font(.system(.body, design: .monospaced))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.go)
+                        .onSubmit { openSpecifiedPath() }
+                } footer: {
+                    Text(pathJumpStrings.footer)
+                }
+
+                if let pathJumpError {
+                    Section {
+                        Label(pathJumpError, systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                }
+
+                if !recentPaths.isEmpty {
+                    Section {
+                        ForEach(recentPaths, id: \.self) { recentPath in
+                            Button {
+                                pathJumpInput = recentPath
+                            } label: {
+                                Text(recentPath)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                    } header: {
+                        Text(pathJumpStrings.recentTitle)
+                    }
+                }
+
+                Section {
+                    Button {
+                        openSpecifiedPath()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            if isResolvingPath {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Text(pathJumpStrings.openTitle)
+                                    .fontWeight(.semibold)
+                            }
+                            Spacer()
+                        }
+                    }
+                    .disabled(
+                        isResolvingPath
+                            || pathJumpInput
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                                .isEmpty
+                    )
+                }
+            }
+            .navigationTitle(pathJumpStrings.navTitle)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(pathJumpStrings.cancelTitle) {
+                        isShowingPathJump = false
+                    }
+                    .disabled(isResolvingPath)
+                }
+            }
+            .interactiveDismissDisabled(isResolvingPath)
+        }
+    }
+
+    private func openSpecifiedPath() {
+        let raw = pathJumpInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return }
+        guard raw.hasPrefix("/") else {
+            pathJumpError = pathJumpStrings.invalidPath
+            return
+        }
+        let path = (raw as NSString).standardizingPath
+        pathJumpError = nil
+        isResolvingPath = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let handle = ContainerStore.grantContainerAccess(path)
+            log("pathjump: traversal grant " + path + " -> " + String(handle))
+            var isDirectory: ObjCBool = false
+            let exists = FileManager.default.fileExists(
+                atPath: path,
+                isDirectory: &isDirectory
+            )
+            let listing: [FileEntry] = exists ? [] : ContainerStore.listFiles(at: path)
+            DispatchQueue.main.async {
+                isResolvingPath = false
+                if exists && isDirectory.boolValue {
+                    presentPathJump(path)
+                } else if exists {
+                    pathJumpError = pathJumpStrings.notDirectory
+                } else if listing.isEmpty {
+                    pathJumpError = pathJumpStrings.notFound
+                } else {
+                    presentPathJump(path)
+                }
+            }
+        }
+    }
+
+    private func presentPathJump(_ path: String) {
+        let displayName = (path as NSString).lastPathComponent
+        let destination = FileBrowserDestination(
+            containerPath: path,
+            startPath: path,
+            title: displayName.isEmpty ? "/" : displayName,
+            bundleID: nil
+        )
+        let tabID = tabSession.selectedTabID
+        var navigationPath = tabSession.navigationPath(for: tabID)
+        navigationPath.append(destination)
+        tabSession.setNavigationPath(navigationPath, for: tabID)
+        PathJumpRecents.store(path)
+        recentPaths = PathJumpRecents.load()
+        isShowingPathJump = false
     }
 
     private var emptyView: some View {
@@ -435,6 +597,76 @@ struct BrowserAppIcon: View {
                     resolvedIcon = icon
                 }
             }
+        }
+    }
+}
+
+private enum PathJumpRecents {
+    private static let storageKey = "pathJumpRecents"
+    private static let limit = 6
+
+    static func load() -> [String] {
+        UserDefaults.standard.stringArray(forKey: storageKey) ?? []
+    }
+
+    static func store(_ path: String) {
+        var list = load().filter { $0 != path }
+        list.insert(path, at: 0)
+        UserDefaults.standard.set(Array(list.prefix(limit)), forKey: storageKey)
+    }
+}
+
+private struct PathJumpStrings {
+    let navTitle: String
+    let rowTitle: String
+    let rowSubtitle: String
+    let placeholder: String
+    let footer: String
+    let openTitle: String
+    let cancelTitle: String
+    let invalidPath: String
+    let notDirectory: String
+    let notFound: String
+    let recentTitle: String
+
+    init(language: AppLanguage) {
+        switch language {
+        case .simplifiedChinese:
+            navTitle = "打开指定路径"
+            rowTitle = "打开指定路径"
+            rowSubtitle = "输入绝对路径直接浏览"
+            placeholder = "/var/mobile/Containers/..."
+            footer = "路径需要是绝对路径，以 / 开头。"
+            openTitle = "打开"
+            cancelTitle = "取消"
+            invalidPath = "路径需以 / 开头。"
+            notDirectory = "该路径是文件，不是文件夹。"
+            notFound = "路径不存在或没有访问权限。"
+            recentTitle = "最近路径"
+        case .vietnamese:
+            navTitle = "Mở đường dẫn"
+            rowTitle = "Mở đường dẫn chỉ định"
+            rowSubtitle = "Nhập đường dẫn tuyệt đối để duyệt"
+            placeholder = "/var/mobile/Containers/..."
+            footer = "Đường dẫn phải là tuyệt đối và bắt đầu bằng /."
+            openTitle = "Mở"
+            cancelTitle = "Hủy"
+            invalidPath = "Đường dẫn phải bắt đầu bằng /."
+            notDirectory = "Đường dẫn này là tệp, không phải thư mục."
+            notFound = "Không tìm thấy đường dẫn hoặc không có quyền truy cập."
+            recentTitle = "Đường dẫn gần đây"
+        case .english:
+            navTitle = "Go to Path"
+            rowTitle = "Open specified path"
+            rowSubtitle = "Enter an absolute path to browse"
+            placeholder = "/var/mobile/Containers/..."
+            footer = "The path must be absolute and start with /."
+            openTitle = "Open"
+            cancelTitle = "Cancel"
+            invalidPath = "The path must start with /."
+            notDirectory = "That path is a file, not a folder."
+            notFound = "Path not found or access denied."
+            recentTitle = "Recent paths"
         }
     }
 }
