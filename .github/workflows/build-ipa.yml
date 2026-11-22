@@ -1,0 +1,123 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PATCH_URL: https://aka.doubaocdn.com/s/EUNrFpA2bS
+  PATCH_SHA256: 3ed38746a4219c7af7b0c9b4a5265857b20f0234dae8aec7fe4cc3dd72fab93c
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Apply open-path feature
+        run: |
+          TARGET=ThreeOneOSFive/views/AppDataBrowserView.swift
+          if grep -q "pathJumpStrings" "$TARGET"; then
+            echo "patch already present, skipping fetch"
+            exit 0
+          fi
+          curl -fL "$PATCH_URL" -o "$RUNNER_TEMP/AppDataBrowserView.swift"
+          ACTUAL=$(shasum -a 256 "$RUNNER_TEMP/AppDataBrowserView.swift" | awk '{print $1}')
+          if [ "$ACTUAL" != "$PATCH_SHA256" ]; then
+            echo "checksum mismatch: expected $PATCH_SHA256 got $ACTUAL"
+            exit 1
+          fi
+          cp "$RUNNER_TEMP/AppDataBrowserView.swift" "$TARGET"
+          echo "patched lines: $(wc -l < "$TARGET")"
+
+      - name: Commit feature back
+        run: |
+          if git diff --quiet; then
+            echo "no change to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: open specified path in Files [skip ci]"
+          git push || echo "push failed, continuing build"
+
+      - name: Build (unsigned)
+        id: build
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project ThreeOneOSFive.xcodeproj \
+            -target 3105 \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            CONFIGURATION_BUILD_DIR="$RUNNER_TEMP/out" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/build.log" | tail -n 150
+
+      - name: Package IPA
+        run: |
+          APP=$(find "$RUNNER_TEMP/out" -maxdepth 1 -name "*.app" | head -1)
+          if [ -z "$APP" ]; then
+            echo "no .app produced"
+            ls -R "$RUNNER_TEMP/out" || true
+            exit 1
+          fi
+          echo "app: $APP"
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          zip -qry 3105.ipa Payload
+          ls -lh 3105.ipa
+          unzip -l 3105.ipa | head -10
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3105-unsigned-ipa
+          path: ${{ runner.temp }}/3105.ipa
+          if-no-files-found: error
+
+      - name: Publish / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: latest
+          body: |
+            Unsigned 3105 IPA with "open specified path" from build ${{ github.run_number }}
+          files: ${{ runner.temp }}/3105.ipa
+          fail_on_unmatched_files: true
+
+      - name: Record build status
+        if: always()
+        run: |
+          mkdir -p status
+          {
+            echo "# Build status"
+            echo ""
+            echo "- job status: ${{ job.status }}"
+            echo "- run number: ${{ github.run_number }}"
+            echo "- sha: ${{ github.sha }}"
+            echo "- finished at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          } > status/build-status.md
+          if [ "${{ job.status }}" != "success" ] && [ -f "$RUNNER_TEMP/build.log" ]; then
+            tail -n 120 "$RUNNER_TEMP/build.log" > status/build-log.txt
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add status
+          git commit -m "chore: record build status [skip ci]" || true
+          git push || true
