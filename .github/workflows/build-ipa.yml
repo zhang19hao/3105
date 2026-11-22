@@ -61,7 +61,6 @@ jobs:
             -target 3105 \
             -configuration Release \
             -sdk iphoneos \
-            -derivedDataPath "$RUNNER_TEMP/dd" \
             CONFIGURATION_BUILD_DIR="$RUNNER_TEMP/out" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
@@ -114,7 +113,7 @@ jobs:
             echo "- finished at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           } > status/build-status.md
           if [ "${{ job.status }}" != "success" ] && [ -f "$RUNNER_TEMP/build.log" ]; then
-            tail -n 120 "$RUNNER_TEMP/build.log" > status/build-log.txt
+            tail -n 160 "$RUNNER_TEMP/build.log" > status/build-log.txt
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
