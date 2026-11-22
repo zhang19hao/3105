@@ -148,6 +148,10 @@ class AppState: ObservableObject {
     }
 
     private func maybeAutoRunKernelExploit() {
+        guard UserDefaults.standard.bool(forKey: "kexploitAutoRun") else {
+            log("app: kernel exploit auto-run is disabled (no kexploitAutoRun opt-in)")
+            return
+        }
         guard !kernelExploitRunning,
               !exploitStatus.isSuccess,
               !exploitStatus.isFailed,
